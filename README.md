@@ -56,25 +56,74 @@ in the account currency instead.
 
 ## Keeping it up to date
 
-Do **not** re-import the full files. Portfolio Performance flags repeats as
-`Opération déjà existante`, but only as a warning you must clear row by row.
-Emit just the new rows:
+Do not re-import the full files. Portfolio Performance flags a repeat as
+`Opération déjà existante`, but only as a warning. You must then clear each
+row by hand.
+
+The script tracks what you imported, so it can emit only the new lines.
+
+### First, record what you already imported
+
+Run this once, after your first manual import:
 
 ```sh
-# 1. Export the COMPLETE history again from Saxo.
-# 2. Replace each tx.xlsx.
-# 3. Emit only rows on or after the day after your last import.
-uv run --with openpyxl python convert.py --since 2026-10-14
+uv run --with openpyxl python convert.py --mark-all
 ```
 
-This writes to `<folder>/depuis-2026-10-14/`, leaving the full files alone.
-Import the two transaction files; skip `1-titres.csv` unless a new holding
-appeared.
+This writes `<folder>/.imported.json`. The file lists one entry per Saxo line.
+It stays local, because it holds dates, amounts and ISINs.
 
-Always export the **complete** history, even for a `--since` run. Dividend
-share counts and dividend corrections are derived from the whole history, so a
-partial export would compute them from partial data. `--since` controls only
-which rows are written, never how they are calculated.
+### Then, on every update
+
+1. Export the **complete** history again from Saxo.
+2. Replace each `tx.xlsx`.
+3. Write the new lines:
+
+```sh
+uv run --with openpyxl python convert.py --new
+```
+
+The script writes only unimported lines to `<folder>/nouveau/`. The full files
+stay unchanged. It prints `no new lines` when there is nothing to do.
+
+4. Import the two transaction files. Skip `1-titres.csv` unless a new holding
+   appeared.
+5. Record them as imported:
+
+```sh
+uv run --with openpyxl python convert.py --confirm
+```
+
+The script keeps the new keys in `<folder>/.pending.json` until you confirm.
+A failed import therefore loses nothing. Run `--new` again to retry.
+
+### How the script identifies a line
+
+Saxo gives no identifier to most lines, so the key depends on the type:
+
+| Line | Key |
+|---|---|
+| Trade | the Saxo order ID, which is unique |
+| Dividend | the security and the **value date** |
+| Cash transfer | the date, the direction and the amount |
+
+Two identical lines get an occurrence index. This assumes Saxo keeps the same
+row order between exports, which holds for the reports tested so far.
+
+A dividend key uses the value date on purpose. A later correction nets onto
+the same key, so the script reports a **changed amount** instead of a new
+line:
+
+```
+CHANGED: div:US8740391003:2026-01-08 was 3.77, now 3.70.
+```
+
+Portfolio Performance cannot import that as a new row. Edit the existing
+transaction by hand.
+
+Always export the **complete** history. The script derives dividend share
+counts and dividend corrections from the whole history. The ledger controls
+only which lines the script writes, never how it calculates them.
 
 ## How the figures are built
 
@@ -152,9 +201,9 @@ Two wordings need explaining:
 - **Corrections.** Saxo books a corrected dividend as extra lines on the same
   security and value date: the original, a negative reversal, and a re-credit.
   Portfolio Performance has no negative dividend type, so each group is
-  collapsed into one net row. A `--since` run warns when a correction lands on
-  a dividend **before** the cutoff, since that cannot be imported as a new row
-  and must be edited by hand.
+  collapsed into one net row. A `--new` run reports a correction that lands on
+  a dividend you already imported, because Portfolio Performance cannot take
+  it as a new row. Edit that transaction by hand.
 - **`Réinvestissement de dividendes`.** Despite the name this can arrive as
   plain cash with no share purchase, so it is imported as a dividend with the
   original wording kept in `Note`.

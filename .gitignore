@@ -3,9 +3,14 @@
 *.xlsx
 *.pdf
 *.csv
-depuis-*/
 tx.txt
 
 .DS_Store
 __pycache__/
 *.pyc
+
+# The ledger records which lines you imported. It holds dates, amounts
+# and ISINs, so it stays local.
+.imported.json
+.pending.json
+nouveau/

@@ -1,20 +1,23 @@
 """Convert a Saxo Bank French transaction report (.xlsx) to Portfolio Performance CSV files.
 
 Usage:
-  python convert.py                      # every account folder, full history
-  python convert.py pea                  # one account
-  python convert.py --since 2026-10-13   # only rows on or after that date
+  python convert.py              # rebuild the full history
+  python convert.py pea          # one account only
+  python convert.py --new        # write only the lines you have not imported
+  python convert.py --confirm    # record those lines as imported
+  python convert.py --mark-all   # record the whole export as imported
 
-One folder per account, each containing the Saxo export as tx.xlsx. With no
-argument, every subfolder holding a tx.xlsx is converted. A full run writes the three CSV files next to
-it. A --since run writes them to <folder>/depuis-<date>/ instead, so the full
-files are left alone.
+One folder per account. Each folder holds the Saxo export as tx.xlsx. With no
+folder argument, the script converts every subfolder that holds a tx.xlsx.
 
-Always export the COMPLETE history from Saxo, even for a --since run. Share
-counts on dividends and dividend corrections are derived from the whole
-history; a partial export would compute them from partial data.
+A full run writes the three CSV files next to the export. A --new run writes
+them to <folder>/nouveau/ instead, so the full files stay unchanged.
+
+Always export the COMPLETE history from Saxo. The script derives dividend
+share counts and dividend corrections from the whole history. A partial
+export computes them from partial data.
 """
-import collections, csv, datetime, os, re, sys
+import collections, csv, json, os, re, sys
 from decimal import Decimal as D, ROUND_HALF_UP
 import openpyxl
 
@@ -147,6 +150,62 @@ def write(path, header, body):
     print(f"  {path}: {len(body)} rows")
 
 
+LEDGER_NAME = ".imported.json"
+PENDING_NAME = ".pending.json"
+
+
+def fingerprint(item):
+    """Return the value that shows whether an imported line changed."""
+    if "side" in item:
+        return f"{item['side']}:{item['shares']}:{item['value']}"
+    return str(item["amount"])
+
+
+def natural_key(item):
+    """Return a stable identity for one Saxo line.
+
+    A trade carries a Saxo order ID, which is unique. A dividend uses the
+    security and the value date. A later correction nets onto the same key, so
+    the script reports it as a changed amount, not as a new line. A cash
+    transfer has no identifier, so it uses the date, the direction and the
+    amount.
+    """
+    if "side" in item:
+        if item["order"]:
+            return f"trade:{item['order']}"
+        return f"trade:{item['date']}:{item['isin']}:{item['side']}:{item['shares']}"
+    if item["event"].startswith(DIVIDEND_EVENTS):
+        return f"div:{item['isin']}:{item['vdate']}"
+    side = "dep" if item["amount"] > 0 else "ret"
+    return f"cash:{item['date']}:{side}:{abs(item['amount'])}"
+
+
+def keyed(items):
+    """Pair each item with its key. A repeated key gets an occurrence index."""
+    seen = collections.Counter()
+    out = []
+    for item in items:
+        key = natural_key(item)
+        seen[key] += 1
+        if seen[key] > 1:
+            key = f"{key}#{seen[key]}"
+        out.append((key, item))
+    return out
+
+
+def read_json(path, default):
+    if not os.path.exists(path):
+        return default
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=1, sort_keys=True, ensure_ascii=False)
+        f.write("\n")
+
+
 def catalogue(trades, divs):
     secs = {}
     for t in trades:
@@ -158,32 +217,62 @@ def catalogue(trades, divs):
     return secs
 
 
-def main(folder, since=None):
+def main(folder, mode="full"):
     rows = load(f"{folder}/tx.xlsx")
     trades, cash, divs = split(rows)
     divs, netted = net_dividends(divs)
-    # Positions, netting and the security list always come from the full
-    # history, even when only a tail of the rows is emitted.
+    # The script derives positions, netting and the security list from the
+    # full history, even when it emits only a few lines.
     pos, div_shares = positions(trades, divs)
     all_secs = catalogue(trades, divs)
 
-    print(f"\n{folder}" + (f" (depuis {since})" if since else "") + ":")
+    print(f"\n{folder} [{mode}]:")
+
+    ledger = read_json(f"{folder}/{LEDGER_NAME}", {}).get("entries", {})
+    marks = keyed(trades) + keyed(divs) + keyed(cash)
+    fresh = {k: fingerprint(i) for k, i in marks if k not in ledger}
+    changed = {k: (ledger[k], fingerprint(i)) for k, i in marks
+               if k in ledger and ledger[k] != fingerprint(i)}
+
+    if mode == "mark-all":
+        write_json(f"{folder}/{LEDGER_NAME}",
+                   {"version": 1, "entries": {k: fingerprint(i) for k, i in marks}})
+        print(f"  recorded all {len(marks)} lines as imported")
+        return
+
+    if mode == "confirm":
+        pending = read_json(f"{folder}/{PENDING_NAME}", None)
+        if not pending:
+            print("  nothing pending. Run --new first.")
+            return
+        ledger.update(pending["entries"])
+        write_json(f"{folder}/{LEDGER_NAME}", {"version": 1, "entries": ledger})
+        os.remove(f"{folder}/{PENDING_NAME}")
+        print(f"  recorded {len(pending['entries'])} lines as imported "
+              f"({len(ledger)} in total)")
+        return
+
+    for key, (was, now) in sorted(changed.items()):
+        print(f"  CHANGED: {key} was {was}, now {now}. Saxo corrected a line you "
+              f"already imported. Edit that transaction in Portfolio Performance "
+              f"by hand.")
+
     out = folder
-    if since:
-        for tk, vd, _parts, tot in netted:
-            if vd < since:
-                print(f"  WARNING: the {tk} dividend with value date {vd} was corrected "
-                      f"by a later line, so its net is now {tot} EUR. That dividend is "
-                      f"before the cutoff. If you already imported it, edit it by hand.")
-        trades = [t for t in trades if t["date"] >= since]
-        cash = [c for c in cash if c["date"] >= since]
-        divs = [d for d in divs if d["date"] >= since]
-        out = f"{folder}/depuis-{since.isoformat()}"
+    if mode == "new":
+        if not fresh:
+            print("  no new lines. Nothing to import.")
+            return
+        keep = {id(i) for k, i in marks if k in fresh}
+        trades = [t for t in trades if id(t) in keep]
+        divs = [d for d in divs if id(d) in keep]
+        cash = [c for c in cash if id(c) in keep]
+        out = f"{folder}/nouveau"
         os.makedirs(out, exist_ok=True)
 
-    # Only emit an exchange rate when the securities are not in the account currency.
+    # The script emits an exchange rate only when the securities sit outside
+    # the account currency.
     fx = any(r["rate"] != 1 for r in rows)
-    secs = catalogue(trades, divs)   # only what the emitted rows refer to
+    secs = catalogue(trades, divs)   # only what the emitted lines refer to
 
     write(f"{out}/1-titres.csv", ["ISIN", "Symbole boursier", "Nom du titre", "Devise"],
           [[s["isin"], s["ticker"], s["name"], s["ccy"]]
@@ -220,9 +309,13 @@ def main(folder, since=None):
     hdr += ["Parts", "Impôts / Taxes", "ISIN", "Symbole boursier", "Nom du titre", "Note"]
     write(f"{out}/3-operations-especes.csv", hdr, acct)
 
+    if mode == "new":
+        write_json(f"{folder}/{PENDING_NAME}", {"version": 1, "entries": fresh})
+        print(f"  {len(fresh)} new lines written. Import them, then run --confirm.")
+
     # ---- reconciliation ----
-    for tk, vd, parts, tot in netted:
-        if not since:
+    if mode == "full":
+        for tk, vd, parts, tot in netted:
             print(f"  netted dividend: {tk} value date {vd}: "
                   f"{' + '.join(str(p) for p in parts)} = {tot} EUR")
     dep = sum(c["amount"] for c in cash if c["amount"] > 0)
@@ -231,32 +324,35 @@ def main(folder, since=None):
     fees = sum(t["fee"] for t in trades)
     net = dep - wit + div - sum(t["value"] if t["side"] == "Acheter" else -t["value"]
                                 for t in trades)
-    print(f"  {len(rows)} rows in file -> {len(trades)} trades + {len(acct)} cash emitted")
+    print(f"  {len(rows)} lines in file -> {len(trades)} trades + {len(acct)} cash emitted")
     print(f"  deposits {dep} | withdrawals {wit} | dividends {div} | fees {fees}")
-    if since:
-        print(f"  net cash effect of the emitted rows: {net} EUR")
-    else:
+    if mode == "full":
         assert net == sum(r["amount"] for r in rows), "does not reconcile"
         print(f"  closing cash {net} EUR (reconciles with the Saxo report)")
+    else:
+        print(f"  net cash effect of the emitted lines: {net} EUR")
     held = [(all_secs[i]["ticker"], q) for i, q in pos.items() if q]
     closed = [all_secs[i]["ticker"] for i, q in pos.items() if not q]
     print("  positions: " + (", ".join(f"{t} {q}" for t, q in sorted(held)) or "none"))
     print("  closed:    " + (", ".join(sorted(closed)) or "none"))
 
 
+MODES = {"--new": "new", "--confirm": "confirm", "--mark-all": "mark-all"}
+
 if __name__ == "__main__":
     args = sys.argv[1:]
-    since = None
-    if "--since" in args:
-        i = args.index("--since")
-        since = datetime.date.fromisoformat(args[i + 1])
-        del args[i:i + 2]
-    folders = [a.rstrip("/") for a in args]
+    mode = "full"
+    for flag, name in MODES.items():
+        if flag in args:
+            mode = name
+            args.remove(flag)
+    unknown = [a for a in args if a.startswith("-")]
+    if unknown:
+        sys.exit(f"unknown option {unknown[0]}. Options: {', '.join(MODES)}")
+    folders = args or sorted(d for d in os.listdir(".")
+                             if os.path.isfile(os.path.join(d, "tx.xlsx")))
     if not folders:
-        folders = sorted(d for d in os.listdir(".")
-                         if os.path.isfile(os.path.join(d, "tx.xlsx")))
-        if not folders:
-            sys.exit("no account folder found. Create one (e.g. cto/) "
-                     "containing the Saxo export as tx.xlsx.")
+        sys.exit("no account folder found. Create one (e.g. cto/) "
+                 "that holds the Saxo export as tx.xlsx.")
     for folder in folders:
-        main(folder, since)
+        main(folder.rstrip("/"), mode)
