@@ -1,0 +1,11 @@
+# Saxo exports and generated output hold account numbers, balances and a full
+# transaction history. Never commit them.
+*.xlsx
+*.pdf
+*.csv
+depuis-*/
+tx.txt
+
+.DS_Store
+__pycache__/
+*.pyc
