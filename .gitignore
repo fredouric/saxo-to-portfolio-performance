@@ -14,3 +14,6 @@ __pycache__/
 .imported.json
 .pending.json
 nouveau/
+
+# Debug text for upstream issues. Check the anonymization before you share it.
+debug-*.txt
